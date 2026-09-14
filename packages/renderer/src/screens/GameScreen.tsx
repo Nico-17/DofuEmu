@@ -5,7 +5,7 @@ import { WindowButton } from '@/components/WindowButton'
 import { useGameTabStore, GameTab } from '@/stores/gameTabStore'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { useTeamStore } from '@/stores/teamStore'
-import { useHotkeys } from '@/hooks/use-hotkeys'
+import { findHotkeyAction, useHotkeys } from '@/hooks/use-hotkeys'
 import { initAutoGroup, broadcastLeaderPosition, destroyAutoGroup, sendPartyInvite, autoAcceptPartyInvite } from '@/mods/auto-group'
 import { initNotificationFocus } from '@/mods/notification-focus'
 import { colors } from '@/theme'
@@ -20,12 +20,192 @@ const MAX_POLL_ATTEMPTS = 50
 const POLL_INTERVAL = 200
 const RESIZE_DELAYS = [100, 250, 500, 1000, 2000]
 const PARTY_INVITE_DELAY = 3000
+const TAB_AUTH_STORE_PREFIX = 'dofemu-tab-auth:'
+
+interface StoredTabAuth {
+  apiKey: string
+  refreshKey?: string
+  keyTimeout?: number
+  accountId?: string
+  certificateId?: string
+  certificateHash?: string
+  updatedAt: number
+}
+
+function getGameTabSrc(gameSrc: string, tabId: string) {
+  const separator = gameSrc.includes('?') ? '&' : '?'
+  return `${gameSrc}${separator}id=${encodeURIComponent(tabId)}`
+}
+
+function getTabAuthStoreKey(tabId: string) {
+  return `${TAB_AUTH_STORE_PREFIX}${tabId}`
+}
+
+function normalizeTabAuth(input: unknown): StoredTabAuth | null {
+  if (!input || typeof input !== 'object') return null
+
+  const value = input as Record<string, unknown>
+  const apiKey = typeof value.apiKey === 'string' ? value.apiKey : ''
+  if (!apiKey) return null
+
+  const accountId =
+    typeof value.accountId === 'number' || typeof value.accountId === 'string'
+      ? String(value.accountId)
+      : undefined
+
+  return {
+    apiKey,
+    refreshKey: typeof value.refreshKey === 'string' ? value.refreshKey : '',
+    keyTimeout: typeof value.keyTimeout === 'number' ? value.keyTimeout : undefined,
+    accountId,
+    certificateId: typeof value.certificateId === 'string' ? value.certificateId : '',
+    certificateHash: typeof value.certificateHash === 'string' ? value.certificateHash : '',
+    updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : Date.now()
+  }
+}
+
+function summarizeTabAuth(auth: StoredTabAuth | null) {
+  if (!auth) return { found: false }
+
+  return {
+    found: true,
+    accountId: auth.accountId || 'unknown',
+    hasApiKey: !!auth.apiKey,
+    hasRefreshKey: !!auth.refreshKey,
+    hasCertificate: !!(auth.certificateId && auth.certificateHash),
+    keyTimeout: auth.keyTimeout || null,
+    updatedAt: auth.updatedAt
+  }
+}
+
+async function getStoredTabAuth(tabId: string): Promise<StoredTabAuth | null> {
+  try {
+    const raw = await window.dofemu.storeGet(getTabAuthStoreKey(tabId))
+    return raw ? normalizeTabAuth(JSON.parse(raw)) : null
+  } catch (error) {
+    window.dofemu.logger.warn('Failed to read saved auth for tab', tabId, error)
+    return null
+  }
+}
+
+function seedGameAuth(gameWindow: DofusWindow, auth: StoredTabAuth) {
+  const gw = gameWindow as DofusWindow & Record<string, unknown>
+  const accountId = auth.accountId || ''
+  const refreshKey = auth.refreshKey || ''
+  const keyTimeout = auth.keyTimeout || Date.now() + 2592e6
+  const certificateId = auth.certificateId || ''
+  const certificateHash = auth.certificateHash || ''
+
+  gw.$_pendingApiKeyHeader = auth.apiKey
+  gw.$_pendingRefreshKey = refreshKey
+  gw.$_pendingHaapiKeyTimeout = keyTimeout
+  gw.$_pendingHaapiAccountId = accountId
+  gw.$_authCertId = certificateId
+  gw.$_authCertHash = certificateHash
+
+  try {
+    gameWindow.localStorage.setItem('HAAPI_KEY', auth.apiKey)
+    gameWindow.localStorage.setItem('HAAPI_REFRESH_TOKEN', refreshKey)
+    gameWindow.localStorage.setItem('HAAPI_KEY_TIMEOUT', String(keyTimeout))
+    if (accountId) {
+      gameWindow.localStorage.setItem('HAAPI_ACCOUNTID', accountId)
+      gameWindow.localStorage.setItem(`${accountId}_CERTIFICATE_ID`, certificateId)
+      gameWindow.localStorage.setItem(`${accountId}_CERTIFICATE_HASH`, certificateHash)
+    }
+  } catch (error) {
+    window.dofemu.logger.warn('Failed to seed game auth storage', error)
+  }
+}
+
+async function restoreTabAuth(gameWindow: DofusWindow, tabId: string) {
+  const auth = await getStoredTabAuth(tabId)
+  window.dofemu.logger.info('Auth restore lookup for tab', tabId, summarizeTabAuth(auth))
+  if (!auth) return
+
+  seedGameAuth(gameWindow, auth)
+  window.dofemu.logger.info('Auth restored for tab', tabId, summarizeTabAuth(auth))
+}
+
+function readGameAuth(gameWindow: DofusWindow): StoredTabAuth | null {
+  try {
+    const gw = gameWindow as DofusWindow & {
+      $_getHaapiKey?: () => { key?: string; refreshToken?: string } | null
+      $_pendingRefreshKey?: string
+      $_pendingHaapiKeyTimeout?: number
+      $_pendingHaapiAccountId?: string | number
+      $_authCertId?: string
+      $_authCertHash?: string
+    }
+    const manager =
+      gw.$_authManager?.getHaapiKeyManager?.() ??
+      gw.$_haapiModule?.getHaapiKeyManager?.() ??
+      gw.$_haapiKeyManager
+    const keyData =
+      gw.$_getHaapiKey?.() ??
+      manager?.getHaapiKey?.() ??
+      null
+    const accountId =
+      manager?.getHaapiAccountId?.() ??
+      gameWindow.localStorage.getItem('HAAPI_ACCOUNTID') ??
+      gw.$_pendingHaapiAccountId
+    const accountIdString = accountId !== undefined && accountId !== null ? String(accountId) : ''
+    const apiKey =
+      keyData?.key ||
+      gameWindow.localStorage.getItem('HAAPI_KEY') ||
+      gw.$_pendingApiKeyHeader
+
+    if (!apiKey) return null
+
+    return {
+      apiKey,
+      refreshKey:
+        keyData?.refreshToken ||
+        gameWindow.localStorage.getItem('HAAPI_REFRESH_TOKEN') ||
+        gw.$_pendingRefreshKey ||
+        '',
+      keyTimeout:
+        Number(gameWindow.localStorage.getItem('HAAPI_KEY_TIMEOUT') || gw.$_pendingHaapiKeyTimeout || 0) || undefined,
+      accountId: accountIdString || undefined,
+      certificateId:
+        (accountIdString ? gameWindow.localStorage.getItem(`${accountIdString}_CERTIFICATE_ID`) : '') ||
+        gw.$_authCertId ||
+        '',
+      certificateHash:
+        (accountIdString ? gameWindow.localStorage.getItem(`${accountIdString}_CERTIFICATE_HASH`) : '') ||
+        gw.$_authCertHash ||
+        '',
+      updatedAt: Date.now()
+    }
+  } catch (error) {
+    window.dofemu.logger.warn('Failed to read game auth state', error)
+    return null
+  }
+}
+
+function saveTabAuth(tabId: string, auth: StoredTabAuth | null) {
+  if (!auth) {
+    window.dofemu.logger.info('Auth save skipped for tab', tabId, summarizeTabAuth(auth))
+    return
+  }
+
+  window.dofemu.storeSet(getTabAuthStoreKey(tabId), JSON.stringify(auth))
+  window.dofemu.logger.info('Auth saved for tab', tabId, summarizeTabAuth(auth))
+}
+
+function saveGameAuth(tabId: string, gameWindow: DofusWindow) {
+  saveTabAuth(tabId, readGameAuth(gameWindow))
+}
+
+function areStringArraysEqual(a: string[], b: string[]) {
+  return a.length === b.length && a.every((value, index) => value === b[index])
+}
 
 declare global {
   interface Window {
     $gameWindows: DofusWindow[]
     $game_id: string
     $current_id: string
+    $pendingAuthTabId?: string | null
     $appSchemeLinkCalled: (payload: string) => void
   }
 }
@@ -123,14 +303,45 @@ function GameLoadingBackdrop({ title, subtitle }: { title: string; subtitle: str
 }
 
 
-function GameIframe({ tab, gameSrc, isVisible }: { tab: GameTab; gameSrc: string; isVisible: boolean }) {
+function GameIframe({
+  tab,
+  gameSrc,
+  isVisible,
+  hotkeys,
+  onHotkeyAction
+}: {
+  tab: GameTab
+  gameSrc: string
+  isVisible: boolean
+  hotkeys: Record<HotkeyAction, string>
+  onHotkeyAction: (action: HotkeyAction) => void
+}) {
   const iframeRef = useRef<HTMLIFrameElementWithDofus>(null)
   const cleanupRef = useRef<Array<() => void>>([])
+  const attachedWindowRef = useRef<DofusWindow | null>(null)
+  const hotkeysRef = useRef(hotkeys)
+  const onHotkeyActionRef = useRef(onHotkeyAction)
   const { setTabReady, setTabLoading, setTabCharacter } = useGameTabStore()
+
+  hotkeysRef.current = hotkeys
+  onHotkeyActionRef.current = onHotkeyAction
 
   const cleanupGameListeners = () => {
     for (const cleanup of cleanupRef.current) cleanup()
     cleanupRef.current = []
+
+    const attachedWindow = attachedWindowRef.current
+    if (attachedWindow && window.parent.$gameWindows) {
+      window.parent.$gameWindows = window.parent.$gameWindows.filter(
+        (gw) => gw !== attachedWindow && gw.$game_id !== tab.id
+      )
+    }
+    attachedWindowRef.current = null
+
+    if (window.$pendingAuthTabId === tab.id) window.$pendingAuthTabId = null
+    if (window.$current_id === tab.id) {
+      window.$current_id = useGameTabStore.getState().activeTabId || ''
+    }
   }
 
   useEffect(() => cleanupGameListeners, [])
@@ -143,8 +354,53 @@ function GameIframe({ tab, gameSrc, isVisible }: { tab: GameTab; gameSrc: string
     setTabReady(tab.id, false)
     setTabLoading(tab.id, true)
 
+    const onGameKeyDown = (event: KeyboardEvent) => {
+      const action = findHotkeyAction(event, hotkeysRef.current)
+      if (!action) return
+
+      event.preventDefault()
+      event.stopPropagation()
+      event.stopImmediatePropagation()
+      window.dofemu.logger.info('Game iframe hotkey', action, 'for tab', tab.id)
+      onHotkeyActionRef.current(action)
+    }
+
+    gameWindow.addEventListener('keydown', onGameKeyDown, true)
+    cleanupRef.current.push(() => gameWindow.removeEventListener('keydown', onGameKeyDown, true))
+
     gameWindow.openDatabase = undefined
-    gameWindow.initDofus(() => {
+    let initTimer: number | null = null
+    let initAttempts = 0
+    cleanupRef.current.push(() => {
+      if (initTimer !== null) window.clearTimeout(initTimer)
+    })
+
+    const startGame = () => {
+      if (!iframeRef.current || iframeRef.current.contentWindow !== gameWindow) return
+
+      if (typeof gameWindow.initDofus !== 'function') {
+        initAttempts += 1
+        if (initAttempts === 1 || initAttempts % 10 === 0) {
+          window.dofemu.logger.warn('initDofus not ready yet for tab', tab.id, gameWindow.location?.href)
+        }
+        if (initAttempts > MAX_POLL_ATTEMPTS) {
+          window.dofemu.logger.error('initDofus never became available for tab', tab.id, gameWindow.location?.href)
+          setTabLoading(tab.id, false)
+          return
+        }
+        initTimer = window.setTimeout(startGame, POLL_INTERVAL)
+        return
+      }
+
+      try {
+        gameWindow.initDofus(onGameInitialized)
+      } catch (err) {
+        window.dofemu.logger.error('initDofus failed for tab', tab.id, err)
+        setTabLoading(tab.id, false)
+      }
+    }
+
+    const onGameInitialized = () => {
       window.dofemu.logger.info('initDofus done for tab', tab.id)
 
       if (!window.parent.$gameWindows) {
@@ -152,7 +408,9 @@ function GameIframe({ tab, gameSrc, isVisible }: { tab: GameTab; gameSrc: string
       }
       gameWindow.$game_id = tab.id
       window.parent.$current_id = tab.id
+      window.parent.$gameWindows = window.parent.$gameWindows.filter((gw) => gw.$game_id !== tab.id)
       window.parent.$gameWindows.push(gameWindow)
+      attachedWindowRef.current = gameWindow
 
       setTabReady(tab.id, true)
       setTabLoading(tab.id, false)
@@ -180,6 +438,7 @@ function GameIframe({ tab, gameSrc, isVisible }: { tab: GameTab; gameSrc: string
           const name = gw.gui.playerData.characterBaseInformations?.name
           if (name) {
             setTabCharacter(tab.id, name)
+            saveGameAuth(tab.id, gameWindow)
 
             const teamState = useTeamStore.getState()
             const matchedChar = teamState.getCharacterByName(name)
@@ -243,8 +502,17 @@ function GameIframe({ tab, gameSrc, isVisible }: { tab: GameTab; gameSrc: string
         const poll = setInterval(() => {
           if (attachGameListeners() || ++attempts > MAX_POLL_ATTEMPTS) clearInterval(poll)
         }, POLL_INTERVAL)
+          cleanupRef.current.push(() => clearInterval(poll))
       }
-    })
+    }
+
+    const bootGame = async () => {
+      await restoreTabAuth(gameWindow, tab.id)
+      if (!iframeRef.current || iframeRef.current.contentWindow !== gameWindow) return
+      startGame()
+    }
+
+    void bootGame()
   }
 
   return (
@@ -261,7 +529,7 @@ function GameIframe({ tab, gameSrc, isVisible }: { tab: GameTab; gameSrc: string
       <iframe
         ref={iframeRef}
         onLoad={handleLoad}
-        src={gameSrc + '?id=' + tab.id}
+        src={getGameTabSrc(gameSrc, tab.id)}
         style={{
           border: 'none',
           width: '100%',
@@ -291,15 +559,41 @@ export function GameScreen() {
   const [isMaximized, setIsMaximized] = useState(false)
   const [dragTabId, setDragTabId] = useState<string | null>(null)
   const [dragOverTabId, setDragOverTabId] = useState<string | null>(null)
+  const [iframeOrder, setIframeOrder] = useState(() => tabs.map((tab) => tab.id))
+  const suppressTabClickRef = useRef(false)
 
   useEffect(() => {
     if (!isHydrated) loadSettings()
   }, [isHydrated, loadSettings])
 
   useEffect(() => {
+    if (activeTabId) window.$current_id = activeTabId
+  }, [activeTabId])
+
+  useEffect(() => {
+    const tabIds = tabs.map((tab) => tab.id)
+
+    setIframeOrder((currentOrder) => {
+      const tabIdSet = new Set(tabIds)
+      const currentIdSet = new Set(currentOrder)
+      const nextOrder = [
+        ...currentOrder.filter((tabId) => tabIdSet.has(tabId)),
+        ...tabIds.filter((tabId) => !currentIdSet.has(tabId))
+      ]
+
+      return areStringArraysEqual(currentOrder, nextOrder) ? currentOrder : nextOrder
+    })
+  }, [tabs])
+
+  useEffect(() => {
     const handler = (e: MessageEvent) => {
       if (e.data?.type === 'dofemu:char-icon') {
         useGameTabStore.getState().setTabIcon(e.data.tabId, e.data.dataUrl)
+        return
+      }
+
+      if (e.data?.type === 'dofemu:auth-state' && typeof e.data.tabId === 'string') {
+        saveTabAuth(e.data.tabId, normalizeTabAuth(e.data.auth))
       }
     }
     window.addEventListener('message', handler)
@@ -317,14 +611,44 @@ export function GameScreen() {
 
   useEffect(() => {
     const unsub = window.dofemu.onAuthCallback((url) => {
-      const iframes = document.querySelectorAll('iframe')
+      const targetId = window.$pendingAuthTabId || window.$current_id || null
+      const iframes = Array.from(document.querySelectorAll('iframe')) as HTMLIFrameElementWithDofus[]
+      const dispatchTo = (win: DofusWindow | null, label: string) => {
+        if (!win?.$appSchemeLinkCalled) return false
+        win.$appSchemeLinkCalled(url)
+        window.$pendingAuthTabId = null
+        window.dofemu.logger.info('Auth callback dispatched to', label)
+        return true
+      }
+      const isFrameVisible = (iframe: HTMLIFrameElement) => {
+        let node: HTMLElement | null = iframe
+        while (node && node !== document.body) {
+          const style = window.getComputedStyle(node)
+          if (style.display === 'none' || style.visibility === 'hidden') return false
+          node = node.parentElement
+        }
+        return true
+      }
+
+      if (targetId) {
+        for (const iframe of iframes) {
+          try {
+            const win = iframe.contentWindow
+            if (win?.$game_id === targetId && dispatchTo(win, `tab ${targetId}`)) return
+          } catch {}
+        }
+      }
+
+      for (const iframe of iframes) {
+        if (!isFrameVisible(iframe)) continue
+        try {
+          if (dispatchTo(iframe.contentWindow, 'visible tab')) return
+        } catch {}
+      }
+
       for (const iframe of iframes) {
         try {
-          const win = (iframe as HTMLIFrameElement).contentWindow as any
-          if (win?.$appSchemeLinkCalled) {
-            win.$appSchemeLinkCalled(url)
-            return
-          }
+          if (dispatchTo(iframe.contentWindow, 'first available tab')) return
         } catch {}
       }
     })
@@ -460,16 +784,21 @@ export function GameScreen() {
 
   const handleDrop = (targetTabId: string) => {
     if (dragTabId && dragTabId !== targetTabId) {
-      const oldIndex = tabs.findIndex((t) => t.id === dragTabId)
-      const newIndex = tabs.findIndex((t) => t.id === targetTabId)
-      const newOrder = tabs.map((t) => t.id)
-      newOrder.splice(oldIndex, 1)
-      newOrder.splice(newIndex, 0, dragTabId)
+      const newOrder = tabs.map((t) => t.id).filter((id) => id !== dragTabId)
+      const targetIndex = newOrder.indexOf(targetTabId)
+      newOrder.splice(targetIndex === -1 ? newOrder.length : targetIndex, 0, dragTabId)
       reorderTabs(newOrder)
     }
     setDragTabId(null)
     setDragOverTabId(null)
   }
+
+  const iframeOrderSet = new Set(iframeOrder)
+  const tabsById = new Map(tabs.map((tab) => [tab.id, tab]))
+  const iframeTabs = [
+    ...iframeOrder.map((tabId) => tabsById.get(tabId)).filter((tab): tab is GameTab => !!tab),
+    ...tabs.filter((tab) => !iframeOrderSet.has(tab.id))
+  ]
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
@@ -491,7 +820,10 @@ export function GameScreen() {
             <button
               key={tab.id}
               draggable
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => {
+                if (suppressTabClickRef.current) return
+                setActiveTab(tab.id)
+              }}
               onDragStart={(e) => {
                 setDragTabId(tab.id)
                 e.dataTransfer.effectAllowed = 'move'
@@ -504,7 +836,14 @@ export function GameScreen() {
               onDragEnter={(e) => { e.preventDefault(); setDragOverTabId(tab.id) }}
               onDragLeave={() => { if (dragOverTabId === tab.id) setDragOverTabId(null) }}
               onDrop={(e) => { e.preventDefault(); handleDrop(tab.id) }}
-              onDragEnd={() => { setDragTabId(null); setDragOverTabId(null) }}
+              onDragEnd={() => {
+                suppressTabClickRef.current = true
+                setDragTabId(null)
+                setDragOverTabId(null)
+                window.setTimeout(() => {
+                  suppressTabClickRef.current = false
+                }, 0)
+              }}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -566,12 +905,14 @@ export function GameScreen() {
         </div>
       </div>
       <div style={{ position: 'relative', flex: 1, minHeight: 0 }}>
-        {tabs.map((tab) => (
+        {iframeTabs.map((tab) => (
           <GameIframe
             key={tab.id}
             tab={tab}
             gameSrc={gameSrc}
             isVisible={tab.id === activeTabId}
+            hotkeys={hotkeys}
+            onHotkeyAction={handleHotkeyAction}
           />
         ))}
       </div>
