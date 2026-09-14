@@ -3,6 +3,78 @@ var attach = function () {
     var gui = window.gui
     var auth = window.$_authManager
     var account = (auth && auth.account) || (gui && gui.account) || window.$_haapiAccount
+    var authState = {}
+    var defaultKeyTimeoutMs = 2592e6
+
+    var getDofEmuTabId = function () {
+      try {
+        if (window.$game_id) return window.$game_id
+        if (window.location && window.location.search) {
+          var match = window.location.search.match(/[?&]id=([^&]+)/)
+          if (match) return decodeURIComponent(match[1])
+        }
+      } catch (err) {}
+      return null
+    }
+
+    var readLocalStorage = function (key) {
+      try {
+        return window.localStorage && window.localStorage.getItem(key)
+      } catch (err) {
+        return ''
+      }
+    }
+
+    var getCertificatePart = function (certificate, methodName) {
+      try {
+        return certificate && typeof certificate[methodName] === 'function' ? certificate[methodName]() : ''
+      } catch (err) {
+        return ''
+      }
+    }
+
+    var publishAuthState = function (partial, reason) {
+      try {
+        authState = Object.assign(authState, partial || {})
+
+        var accountId = authState.accountId || window.$_pendingHaapiAccountId || readLocalStorage('HAAPI_ACCOUNTID')
+        var accountKey = accountId ? String(accountId) : ''
+        var apiKey = authState.apiKey || window.$_pendingApiKeyHeader || readLocalStorage('HAAPI_KEY')
+        var refreshKey = authState.refreshKey || window.$_pendingRefreshKey || readLocalStorage('HAAPI_REFRESH_TOKEN')
+        var keyTimeout = authState.keyTimeout || window.$_pendingHaapiKeyTimeout || readLocalStorage('HAAPI_KEY_TIMEOUT')
+        var certificateId = authState.certificateId || window.$_authCertId || (accountKey && readLocalStorage(accountKey + '_CERTIFICATE_ID'))
+        var certificateHash = authState.certificateHash || window.$_authCertHash || (accountKey && readLocalStorage(accountKey + '_CERTIFICATE_HASH'))
+
+        if (!apiKey && !accountKey && !certificateId) return
+
+        var payload = {
+          apiKey: apiKey || '',
+          refreshKey: refreshKey || '',
+          keyTimeout: Number(keyTimeout || 0) || 0,
+          accountId: accountKey,
+          certificateId: certificateId || '',
+          certificateHash: certificateHash || '',
+          updatedAt: Date.now()
+        }
+
+        if (window.top && window.top.postMessage) {
+          window.top.postMessage({ type: 'dofemu:auth-state', tabId: getDofEmuTabId(), auth: payload }, '*')
+        }
+
+        console.info(
+          'DofEmu auth state',
+          reason || 'update',
+          'tab=' + (getDofEmuTabId() || 'unknown'),
+          'account=' + (payload.accountId || 'none'),
+          'apiKey=' + Boolean(payload.apiKey),
+          'refresh=' + Boolean(payload.refreshKey),
+          'certificate=' + Boolean(payload.certificateId && payload.certificateHash),
+          'timeout=' + (payload.keyTimeout || 'none')
+        )
+      } catch (err) {
+        console.error('DofEmu publish auth state failed:', err)
+      }
+    }
 
     if (gui && gui.playerData && typeof gui.playerData.setLoginName === 'function') {
       window.$_setLoginName = gui.playerData.setLoginName.bind(gui.playerData)
@@ -42,6 +114,69 @@ var attach = function () {
         : null
 
     if (mgr) {
+      if (!mgr.$_dofEmuPersistPatch) {
+        mgr.$_dofEmuPersistPatch = true
+
+        if (typeof mgr.setHaapiKey === 'function') {
+          var originalSetHaapiKey = mgr.setHaapiKey.bind(mgr)
+          mgr.setHaapiKey = function (apiKey, refreshKey, options) {
+            var result = originalSetHaapiKey(apiKey, refreshKey, options)
+            publishAuthState({
+              apiKey: apiKey,
+              refreshKey: refreshKey || '',
+              keyTimeout: options && options.timeout
+            }, 'setHaapiKey')
+            return result
+          }
+        }
+
+        if (typeof mgr.setHaapiAccountId === 'function') {
+          var originalSetHaapiAccountId = mgr.setHaapiAccountId.bind(mgr)
+          mgr.setHaapiAccountId = function (id, options) {
+            var result = originalSetHaapiAccountId(id, options)
+            publishAuthState({ accountId: id }, 'setHaapiAccountId')
+            return result
+          }
+        }
+
+        if (typeof mgr.setCertificate === 'function') {
+          var originalSetCertificate = mgr.setCertificate.bind(mgr)
+          mgr.setCertificate = function (certificate, options) {
+            var result = originalSetCertificate(certificate, options)
+            publishAuthState({
+              certificateId: getCertificatePart(certificate, 'getId'),
+              certificateHash: getCertificatePart(certificate, 'getEncodedData')
+            }, 'setCertificate')
+            return result
+          }
+        }
+
+        if (typeof mgr._setCertificateToStorage === 'function') {
+          var originalSetCertificateToStorage = mgr._setCertificateToStorage.bind(mgr)
+          mgr._setCertificateToStorage = function (certificate) {
+            var result = originalSetCertificateToStorage(certificate)
+            publishAuthState({
+              certificateId: getCertificatePart(certificate, 'getId'),
+              certificateHash: getCertificatePart(certificate, 'getEncodedData')
+            }, 'storeCertificate')
+            return result
+          }
+        }
+      }
+
+      if (window.$_pendingHaapiAccountId && typeof mgr.setHaapiAccountId === 'function') {
+        mgr.setHaapiAccountId(window.$_pendingHaapiAccountId, { save: true })
+      }
+
+      if (window.$_pendingApiKeyHeader && typeof mgr.setHaapiKey === 'function') {
+        mgr.setHaapiKey(window.$_pendingApiKeyHeader, window.$_pendingRefreshKey || '', {
+          save: true,
+          timeout: window.$_pendingHaapiKeyTimeout || Date.now() + defaultKeyTimeoutMs
+        })
+      }
+
+      publishAuthState({}, 'attach')
+
       if (!window.$_setHaapiKey && typeof mgr.setHaapiKey === 'function') {
         window.$_setHaapiKey = function (apiKey, refreshKey, options) {
           try { mgr.setHaapiKey(apiKey, refreshKey || '', options) } catch (err) { console.error('DofEmu setHaapiKey failed:', err) }
@@ -85,34 +220,6 @@ var attach = function () {
 
     if (account && typeof account.createToken === 'function') {
       window.$_haapiDirectLogin = function (opts, cb) {
-        try {
-          var o = opts || {}
-          var localMgr = mgr
-          var restoreGet = null
-          if (localMgr && typeof localMgr.getHaapiKey === 'function' && o.apiKey) {
-            restoreGet = localMgr.getHaapiKey.bind(localMgr)
-            localMgr.getHaapiKey = function () {
-              return { key: o.apiKey, refreshToken: o.refreshKey || '' }
-            }
-          }
-          if (localMgr) {
-            if (o.accountId && localMgr.setHaapiAccountId) localMgr.setHaapiAccountId(o.accountId, { save: o.save !== false })
-            if (o.apiKey && localMgr.setHaapiKey) localMgr.setHaapiKey(o.apiKey, o.refreshKey || '', { save: o.save !== false })
-          }
-          if (o.certificateId) window.$_authCertId = o.certificateId
-          if (o.certificateHash) window.$_authCertHash = o.certificateHash
-          var payload = Object.assign({}, o.params || {})
-          if (!payload.certificate_id && o.certificateId) payload.certificate_id = o.certificateId
-          if (!payload.certificate_hash && o.certificateHash) payload.certificate_hash = o.certificateHash
-          var done = function (err, res) {
-            if (restoreGet && localMgr) localMgr.getHaapiKey = restoreGet
-            if (typeof cb === 'function') cb(err, res)
-          }
-          return account.createToken(payload, done)
-        } catch (err) {
-          console.error('DofEmu haapiDirectLogin failed:', err)
-          if (typeof cb === 'function') cb(err)
-        }
       }
       if (window.parent && window.parent !== window) window.parent.$_haapiDirectLogin = window.$_haapiDirectLogin
     }
@@ -132,6 +239,7 @@ var attach = function () {
           if (window.localStorage) {
             window.localStorage.setItem('HAAPI_KEY', apiKey || '')
             window.localStorage.setItem('HAAPI_REFRESH_TOKEN', refreshKey || '')
+            window.localStorage.setItem('HAAPI_KEY_TIMEOUT', Date.now() + defaultKeyTimeoutMs)
             if (typeof accountId === 'number') {
               window.localStorage.setItem('HAAPI_ACCOUNTID', accountId.toString())
               window.localStorage.setItem(accountId + '_CERTIFICATE_ID', certificateId || '')
@@ -144,6 +252,14 @@ var attach = function () {
             window.parent.$_authCertId = window.$_authCertId
             window.parent.$_authCertHash = window.$_authCertHash
           }
+          publishAuthState({
+            apiKey: apiKey,
+            refreshKey: refreshKey || '',
+            accountId: accountId,
+            certificateId: certificateId || '',
+            certificateHash: certificateHash || '',
+            keyTimeout: Date.now() + defaultKeyTimeoutMs
+          }, 'primeHaapiKey')
         } catch (err) {
           console.error('DofEmu primeHaapiKey failed:', err)
         }
