@@ -1,10 +1,11 @@
 import { app, BrowserWindow, ipcMain, Notification, shell } from 'electron'
 import { Hono, type Context } from 'hono'
 import { serve } from '@hono/node-server'
+import getPort from 'get-port'
 import crypto from 'crypto'
 import { Server } from 'http'
 import { AddressInfo } from 'net'
-import { join } from 'path'
+import path, { join } from 'path'
 import fs from 'fs'
 import ElectronStore from 'electron-store'
 import { IPCEvents, GameContext, NativeNotificationPayload, AppUpdateStatus } from '@dofemu/shared'
@@ -38,11 +39,14 @@ const MIME_TYPES: Record<string, string> = {
 }
 
 function createStaticHandler(basePath: string, urlPrefix: string) {
+  const rootPath = path.resolve(basePath)
+
   return async (c: Context) => {
     const reqPath = c.req.path.slice(urlPrefix.length)
-    const filePath = join(basePath, decodeURIComponent(reqPath))
+    const filePath = path.resolve(rootPath, decodeURIComponent(reqPath))
+    const relativePath = path.relative(rootPath, filePath)
 
-    if (!filePath.startsWith(basePath)) {
+    if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
       return c.text('Forbidden', 403)
     }
 
@@ -67,6 +71,61 @@ function createStaticHandler(basePath: string, urlPrefix: string) {
 
 type StoreSchema = Record<string, unknown>
 
+const LOCAL_SERVER_HOST = '127.0.0.1'
+const PREFERRED_LOCAL_SERVER_PORT = 64893
+const LOCAL_SERVER_PORT_STORE_KEY = 'localServerPort'
+
+function isValidPort(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 1023 && value < 65536
+}
+
+function findMostRecentGameOriginPort(): number | null {
+  const indexedDbPath = path.join(app.getPath('userData'), 'Partitions', '0', 'IndexedDB')
+  if (!fs.existsSync(indexedDbPath)) return null
+
+  try {
+    const candidates = fs.readdirSync(indexedDbPath, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const match = /^http_127\.0\.0\.1_(\d+)\.indexeddb\.leveldb$/.exec(entry.name)
+        if (!match) return null
+
+        const port = Number(match[1])
+        if (!isValidPort(port)) return null
+
+        const fullPath = path.join(indexedDbPath, entry.name)
+        const mtimeMs = fs.statSync(fullPath).mtimeMs
+        return { port, mtimeMs }
+      })
+      .filter((entry): entry is { port: number; mtimeMs: number } => !!entry)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+
+    return candidates[0]?.port ?? null
+  } catch (err) {
+    logger.warn('Failed to inspect persisted game origins', err)
+    return null
+  }
+}
+
+async function resolveLocalServerPort(store: ElectronStore<StoreSchema>): Promise<number> {
+  const storedPort = store.get(LOCAL_SERVER_PORT_STORE_KEY)
+  const discoveredPort = isValidPort(storedPort) ? storedPort : findMostRecentGameOriginPort()
+  const preferredPort = discoveredPort ?? PREFERRED_LOCAL_SERVER_PORT
+  const fallbackPorts = getPort.makeRange(PREFERRED_LOCAL_SERVER_PORT, PREFERRED_LOCAL_SERVER_PORT + 20)
+  const port = await getPort({
+    host: LOCAL_SERVER_HOST,
+    port: [preferredPort, ...fallbackPorts]
+  })
+
+  if (port !== preferredPort) {
+    logger.warn(`Preferred local server port ${preferredPort} unavailable, using ${port}. Game storage origin will change.`)
+  }
+
+  store.set(LOCAL_SERVER_PORT_STORE_KEY, port)
+  logger.info(`Resolved local server port: ${port} (stored=${isValidPort(storedPort) ? storedPort : 'none'}, discovered=${discoveredPort ?? 'none'})`)
+  return port
+}
+
 export class Application {
   private static _instance: Application | null = null
   private _gameWindow: GameWindow | null = null
@@ -83,6 +142,8 @@ export class Application {
     if (Application._instance) throw new Error('Application already initialized')
 
     const hash = crypto.createHash('sha256').update(app.getName() + app.getVersion()).digest('hex')
+    const store = new ElectronStore<StoreSchema>({ name: 'dofemu-data' })
+    const localServerPort = await resolveLocalServerPort(store)
 
     const honoApp = new Hono()
 
@@ -98,8 +159,8 @@ export class Application {
     const server: Server = await new Promise((resolve) => {
       const s = serve({
         fetch: honoApp.fetch,
-        port: 0,
-        hostname: '127.0.0.1'
+        port: localServerPort,
+        hostname: LOCAL_SERVER_HOST
       }) as Server
 
       s.on('listening', () => {
@@ -109,17 +170,17 @@ export class Application {
       })
     })
 
-    Application._instance = new Application(server, hash)
+    Application._instance = new Application(server, hash, store)
   }
 
   static get instance(): Application {
     return Application._instance!
   }
 
-  private constructor(server: Server, hash: string) {
+  private constructor(server: Server, hash: string, store: ElectronStore<StoreSchema>) {
     this._server = server
     this._hash = hash
-    this._store = new ElectronStore<StoreSchema>({ name: 'dofemu-data' })
+    this._store = store
   }
 
   get gameWindow(): GameWindow | null {
