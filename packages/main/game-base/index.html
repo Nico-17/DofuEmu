@@ -5,11 +5,46 @@
       // Touch fix
       window.ontouchstart = function(e) {};
 
+      window.onerror = function(message, source, lineno, colno, error) {
+        console.error("DofEmu game bootstrap error", message, source, lineno, colno, error);
+      };
+
+      window.onunhandledrejection = function(event) {
+        console.error("DofEmu game bootstrap unhandled rejection", event.reason);
+      };
+
+      window.initDofus = function(cb) {
+        var head = document.getElementsByTagName("head")[0];
+
+        var scriptScript = document.createElement("script");
+        scriptScript.addEventListener("load", function() {
+          var fixesScript = document.createElement("script");
+          fixesScript.addEventListener("error", function(e) {
+            console.error("DofEmu failed to load fixes.js", e);
+          });
+          fixesScript.src = "fixes.js";
+          head.appendChild(fixesScript);
+          cb();
+        });
+        scriptScript.addEventListener("error", function(e) {
+          console.error("DofEmu failed to load build/script.js", e);
+        });
+        scriptScript.src = "build/script.js";
+        head.appendChild(scriptScript);
+      };
+
+      function getDofEmuTopValue(name, fallback) {
+        try {
+          if (window.top && typeof window.top[name] !== "undefined") return window.top[name];
+        } catch (e) {}
+        return fallback;
+      }
+
       // Init
-      window.buildVersion = window.top.buildVersion;
-      window.appVersion = window.top.appVersion;
+      window.buildVersion = getDofEmuTopValue("buildVersion", window.buildVersion || "");
+      window.appVersion = getDofEmuTopValue("appVersion", window.appVersion || "");
       window.appInfo = {
-        version: window.top.appVersion
+        version: window.appVersion
       };
 
       window._ = {
@@ -26,6 +61,83 @@
 
       var _deepLinkCallbacks = [];
 
+      function getDofEmuTabId() {
+        try {
+          if (window.$game_id) return window.$game_id;
+          if (window.location && window.location.search) {
+            var match = window.location.search.match(/[?&]id=([^&]+)/);
+            if (match) return decodeURIComponent(match[1]);
+          }
+        } catch (e) {}
+        return null;
+      }
+
+      function isDofEmuScopedStorageKey(key) {
+        return key === "CODE_VERIFIER" ||
+          key === "UNIQUE_NICKNAME" ||
+          /^HAAPI_/.test(key) ||
+          /^\d+_CERTIFICATE_(ID|HASH)$/.test(key);
+      }
+
+      function getDofEmuScopedStorageKey(key) {
+        var tabId = getDofEmuTabId();
+        return tabId && isDofEmuScopedStorageKey(key) ? "dofemu:" + tabId + ":" + key : key;
+      }
+
+      (function patchDofEmuScopedStorage() {
+        try {
+          if (!window.Storage || window.Storage.prototype.$dofEmuScopedStorage) return;
+
+          var proto = window.Storage.prototype;
+          var getItem = proto.getItem;
+          var setItem = proto.setItem;
+          var removeItem = proto.removeItem;
+
+          proto.$dofEmuScopedStorage = true;
+          proto.getItem = function(key) {
+            return getItem.call(this, getDofEmuScopedStorageKey(String(key)));
+          };
+          proto.setItem = function(key, value) {
+            return setItem.call(this, getDofEmuScopedStorageKey(String(key)), value);
+          };
+          proto.removeItem = function(key) {
+            removeItem.call(this, getDofEmuScopedStorageKey(String(key)));
+            return removeItem.call(this, String(key));
+          };
+
+          console.info("DofEmu scoped auth storage ready", getDofEmuTabId());
+        } catch (e) {
+          console.error("DofEmu scoped auth storage patch failed", e);
+        }
+      })();
+
+      function markDofEmuCurrentTab() {
+        try {
+          var tabId = getDofEmuTabId();
+          if (!tabId || !window.top) return;
+          window.top.$current_id = tabId;
+        } catch (e) {}
+      }
+
+      function markDofEmuAuthTab() {
+        try {
+          var tabId = getDofEmuTabId();
+          if (!tabId || !window.top) return;
+          window.top.$pendingAuthTabId = tabId;
+          window.top.$current_id = tabId;
+        } catch (e) {}
+      }
+
+      function openDofEmuExternalUrl(url) {
+        markDofEmuAuthTab();
+        window.open(url, "_system");
+      }
+
+      window.$dofEmuMarkAuthTab = markDofEmuAuthTab;
+      window.addEventListener("focus", markDofEmuCurrentTab, true);
+      window.addEventListener("mousedown", markDofEmuCurrentTab, true);
+      window.addEventListener("touchstart", markDofEmuCurrentTab, true);
+
       window.IonicDeeplink = {
         onDeepLink: function(cb) {
           _deepLinkCallbacks.push(cb);
@@ -35,7 +147,7 @@
       window.cordova = {
         InAppBrowser: {
           open: function(url, target) {
-            window.open(url, "_system");
+            openDofEmuExternalUrl(url);
             return null;
           }
         },
@@ -45,7 +157,7 @@
               cb(true);
             },
             openUrl: function(url, success, error) {
-              window.open(url, "_system");
+              openDofEmuExternalUrl(url);
               if (success) success();
             },
             close: function() {}
@@ -80,7 +192,7 @@
         }
       };
 
-      if (window.top.platform == "darwin") {
+      if (getDofEmuTopValue("platform", "") == "darwin") {
         (function() {
           window.requestAnimationFrame = function(callback) {
             var self = requestAnimationFrame;
@@ -100,20 +212,6 @@
           requestAnimationFrame.timeout = null;
         })();
       }
-
-      window.initDofus = function(cb) {
-        var head = document.getElementsByTagName("head")[0];
-
-        var scriptScript = document.createElement("script");
-        scriptScript.addEventListener("load", function() {
-          var fixesScript = document.createElement("script");
-          fixesScript.src = "fixes.js";
-          head.appendChild(fixesScript);
-          cb();
-        });
-        scriptScript.src = "build/script.js";
-        head.appendChild(scriptScript);
-      };
     </script>
     <meta charset="UTF-8">
     <link rel="stylesheet" href="build/styles-native.css" />
